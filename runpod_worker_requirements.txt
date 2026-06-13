@@ -1,0 +1,18 @@
+# Requirements for the RunPod Serverless worker (BassRipper cloud handler)
+audio-separator==0.41.1
+soundfile==0.13.1
+numpy>=1.26
+runpod>=1.7.0
+
+# NOTE: torch + torchaudio are installed *before* this file in the Dockerfile (with the correct CUDA index URL
+# for GPU workers). Listing them here again is mostly for the "upload code + requirements.txt" deployment path.
+# For GPU acceleration (the whole point of RunPod), make sure you install the CUDA variant, not the CPU one.
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# When using the "upload code" path in RunPod dashboard:
+# - Rename this file to requirements.txt
+# - Rename runpod_handler.py to handler.py
+# - In the endpoint, set env var MODEL_CACHE to your Network Volume mount + a subdir, e.g. /runpod-volume/models
+# - Attach the volume
+# - After first "Running", trigger one job so the model downloads once to the volume.
