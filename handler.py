@@ -219,9 +219,5 @@ def handler(job):
         # Always return errors so the client can fallback to local
         return {"error": str(e)}
 
-#redeploy test 
-
-# RunPod Serverless will import this file and look for the handler.
-# The start() call must be at module level (not inside if __name__).
 import runpod
 runpod.serverless.start({"handler": handler})
