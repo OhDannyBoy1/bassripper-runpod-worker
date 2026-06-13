@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy handler and requirements
-COPY runpod_handler.py .
-COPY runpod_worker_requirements.txt requirements.txt
+COPY handler.py .
+CMD ["python", "handler.py"]
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
