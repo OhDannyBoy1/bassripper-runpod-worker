@@ -220,7 +220,7 @@ def handler(job):
         return {"error": str(e)}
 
 
-# This is what RunPod calls
-if __name__ == "__main__":
-    import runpod
-    runpod.serverless.start({"handler": handler})
+# RunPod Serverless will import this file and look for the handler.
+# The start() call must be at module level (not inside if __name__).
+import runpod
+runpod.serverless.start({"handler": handler})
