@@ -6,14 +6,19 @@ This is the code that runs on RunPod's GPU.
 Deploy as a Serverless endpoint:
 1. Create new Serverless endpoint in RunPod dashboard
 2. Prefer a GPU Python template (CUDA) or build/push the Dockerfile as custom container image.
-3. Upload this file **renamed exactly to handler.py**
-4. Upload runpod_worker_requirements.txt **renamed exactly to requirements.txt**
-   (The Dockerfile also exists for full custom images.)
+3. For "Upload code" path: upload this file as handler.py
+4. For "Upload code" path: upload the *worker* requirements (the file named runpod_worker_requirements.txt in the repo) as requirements.txt
+   (The Dockerfile handles the mapping for Docker builds: it copies runpod_worker_requirements.txt as requirements.txt inside the image.)
 5. **Attach a Network Volume** and note the mount path you chose (e.g. /runpod-volume).
 6. Choose a strong GPU (RTX 4090-class recommended).
 7. Set min workers to 1 (or higher), idle timeout reasonably high, and pre-warm once "Running".
 8. Deploy and copy the Serverless Endpoint ID into the desktop app's runpod_endpoint_id.txt
    (together with a valid runpod_api_key.txt). The desktop app commits to cloud or falls back locally.
+
+Note on requirements files (important):
+- Root requirements.txt in the repo = for the desktop BassRipper app + PyInstaller builds (includes customtkinter etc.).
+- runpod_worker_requirements.txt = only for the RunPod worker (audio-separator, runpod, torch etc.).
+- Inside the worker container/image we always end up with a file named requirements.txt containing the worker deps.
 
 Model cache (critical for fast cold starts):
   The large model is downloaded on first load_model(). Point MODEL_CACHE (env var or edit below)
