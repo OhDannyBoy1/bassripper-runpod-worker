@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir \
     audio-separator==0.41.1 \
     soundfile==0.13.1 \
     "numpy>=1.26" \
-    "runpod>=1.7.0"
+    "runpod>=1.7.0" \
+    onnxruntime
 
 COPY handler.py .
 
