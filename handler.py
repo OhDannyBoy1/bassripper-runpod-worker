@@ -77,7 +77,9 @@ CHUNK_DURATION = 60
 
 # RunPod /run responses are also capped at 10 MiB (same as upload).
 MAX_CLOUD_RESPONSE_BYTES = int(9.5 * 1024 * 1024)
-CLOUD_RETURN_BITRATES = ("128k", "96k", "64k", "48k", "32k")
+# Backing track quality matters most — try higher bitrates for no-bass first.
+NO_BASS_RETURN_BITRATES = ("192k", "128k", "96k", "64k", "48k", "32k")
+BASS_RETURN_BITRATES = ("128k", "96k", "64k", "48k", "32k")
 
 # Model cache directory. Override with env var MODEL_CACHE so you can point it at your Network Volume mount.
 # Example (in RunPod endpoint settings): MODEL_CACHE=/runpod-volume/models
@@ -154,6 +156,37 @@ def _encode_mp3_candidate(source_mp3: Path, work_dir: Path, bitrate: str) -> byt
         temp_out.unlink(missing_ok=True)
 
 
+def _response_result(
+    no_bass_bytes: bytes,
+    no_bass_name: str,
+    no_bass_bitrate: str,
+    bass_bytes: bytes | None = None,
+    bass_name: str | None = None,
+    bass_bitrate: str | None = None,
+) -> dict:
+    size = estimate_response_payload_bytes(no_bass_bytes, no_bass_name, bass_bytes, bass_name)
+    if bass_bitrate:
+        print(
+            f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
+            f"(no_bass @ {no_bass_bitrate}, bass @ {bass_bitrate})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
+            f"(no_bass @ {no_bass_bitrate})",
+            flush=True,
+        )
+    result = {
+        "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
+        "filename": no_bass_name,
+    }
+    if bass_bytes is not None and bass_name:
+        result["bass_output_base64"] = base64.b64encode(bass_bytes).decode("utf-8")
+        result["bass_filename"] = bass_name
+    return result
+
+
 def build_cloud_response_payload(
     no_bass_path: Path,
     work_dir: Path,
@@ -163,39 +196,30 @@ def build_cloud_response_payload(
     no_bass_name = no_bass_path.name
     bass_name = bass_path.name if bass_path else None
 
-    for no_bass_bitrate in CLOUD_RETURN_BITRATES:
-        no_bass_bytes = _encode_mp3_candidate(no_bass_path, work_dir, no_bass_bitrate)
-        if bass_path is None:
+    if bass_path is None:
+        for no_bass_bitrate in NO_BASS_RETURN_BITRATES:
+            no_bass_bytes = _encode_mp3_candidate(no_bass_path, work_dir, no_bass_bitrate)
             size = estimate_response_payload_bytes(no_bass_bytes, no_bass_name)
             if size <= MAX_CLOUD_RESPONSE_BYTES:
-                print(
-                    f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
-                    f"(no_bass @ {no_bass_bitrate})",
-                    flush=True,
+                return _response_result(no_bass_bytes, no_bass_name, no_bass_bitrate)
+    else:
+        # Backing track first: hold no-bass at 128k and lower bass before touching no-bass.
+        for no_bass_bitrate in ("128k", "96k", "64k", "48k", "32k"):
+            no_bass_bytes = _encode_mp3_candidate(no_bass_path, work_dir, no_bass_bitrate)
+            for bass_bitrate in BASS_RETURN_BITRATES:
+                bass_bytes = _encode_mp3_candidate(bass_path, work_dir, bass_bitrate)
+                size = estimate_response_payload_bytes(
+                    no_bass_bytes, no_bass_name, bass_bytes, bass_name
                 )
-                return {
-                    "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
-                    "filename": no_bass_name,
-                }
-            continue
-
-        for bass_bitrate in CLOUD_RETURN_BITRATES:
-            bass_bytes = _encode_mp3_candidate(bass_path, work_dir, bass_bitrate)
-            size = estimate_response_payload_bytes(
-                no_bass_bytes, no_bass_name, bass_bytes, bass_name
-            )
-            if size <= MAX_CLOUD_RESPONSE_BYTES:
-                print(
-                    f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
-                    f"(no_bass @ {no_bass_bitrate}, bass @ {bass_bitrate})",
-                    flush=True,
-                )
-                return {
-                    "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
-                    "filename": no_bass_name,
-                    "bass_output_base64": base64.b64encode(bass_bytes).decode("utf-8"),
-                    "bass_filename": bass_name,
-                }
+                if size <= MAX_CLOUD_RESPONSE_BYTES:
+                    return _response_result(
+                        no_bass_bytes,
+                        no_bass_name,
+                        no_bass_bitrate,
+                        bass_bytes,
+                        bass_name,
+                        bass_bitrate,
+                    )
 
     raise RuntimeError(
         "Processed audio is too large for RunPod's 10 MiB response limit. "
