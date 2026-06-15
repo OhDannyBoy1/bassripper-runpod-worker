@@ -50,12 +50,14 @@ Output:
 """
 
 import base64
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import traceback
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +74,10 @@ print("[handler] imports successful", flush=True)
 BASS_KEYWORDS = ["bass", "drums+bass", "bass+drums", "low", "bassline"]
 MODEL_FILENAME = "htdemucs_ft.yaml"
 CHUNK_DURATION = 60
+
+# RunPod /run responses are also capped at 10 MiB (same as upload).
+MAX_CLOUD_RESPONSE_BYTES = int(9.5 * 1024 * 1024)
+CLOUD_RETURN_BITRATES = ("128k", "96k", "64k", "48k", "32k")
 
 # Model cache directory. Override with env var MODEL_CACHE so you can point it at your Network Volume mount.
 # Example (in RunPod endpoint settings): MODEL_CACHE=/runpod-volume/models
@@ -94,29 +100,107 @@ def get_ffmpeg_path():
     return "ffmpeg"
 
 
-def convert_to_mp3(input_wav: Path, output_mp3: Path):
-    """Convert WAV to MP3 using ffmpeg."""
-    try:
-        ffmpeg = get_ffmpeg_path()
-        cmd = [
+def _ffmpeg_mp3(input_path: Path, output_mp3: Path, bitrate: str) -> None:
+    """CBR MP3. Do not pass -q:a — it forces VBR and can blow past RunPod's 10 MiB cap."""
+    ffmpeg = get_ffmpeg_path()
+    subprocess.run(
+        [
             str(ffmpeg),
             "-y",
-            "-i", str(input_wav),
+            "-i", str(input_path),
+            "-vn",
             "-codec:a", "libmp3lame",
-            "-b:a", "192k",
-            "-q:a", "0",
-            str(output_mp3)
-        ]
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True
-        )
+            "-b:a", bitrate,
+            str(output_mp3),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def convert_to_mp3(input_wav: Path, output_mp3: Path, bitrate: str = "128k"):
+    """Convert WAV to MP3 using ffmpeg."""
+    try:
+        _ffmpeg_mp3(input_wav, output_mp3, bitrate)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"MP3 conversion failed: {e.stderr}")
     except FileNotFoundError:
         raise RuntimeError("ffmpeg not found in the RunPod environment.")
+
+
+def estimate_response_payload_bytes(
+    no_bass_bytes: bytes,
+    no_bass_filename: str,
+    bass_bytes: bytes | None = None,
+    bass_filename: str | None = None,
+) -> int:
+    payload = {
+        "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
+        "filename": no_bass_filename,
+    }
+    if bass_bytes is not None and bass_filename:
+        payload["bass_output_base64"] = base64.b64encode(bass_bytes).decode("utf-8")
+        payload["bass_filename"] = bass_filename
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _encode_mp3_candidate(source_mp3: Path, work_dir: Path, bitrate: str) -> bytes:
+    temp_out = work_dir / f"cloud_ret_{uuid.uuid4().hex}_{bitrate}.mp3"
+    _ffmpeg_mp3(source_mp3, temp_out, bitrate)
+    try:
+        return temp_out.read_bytes()
+    finally:
+        temp_out.unlink(missing_ok=True)
+
+
+def build_cloud_response_payload(
+    no_bass_path: Path,
+    work_dir: Path,
+    bass_path: Path | None = None,
+) -> dict:
+    """Re-encode outputs until the JSON job result fits RunPod's 10 MiB response cap."""
+    no_bass_name = no_bass_path.name
+    bass_name = bass_path.name if bass_path else None
+
+    for no_bass_bitrate in CLOUD_RETURN_BITRATES:
+        no_bass_bytes = _encode_mp3_candidate(no_bass_path, work_dir, no_bass_bitrate)
+        if bass_path is None:
+            size = estimate_response_payload_bytes(no_bass_bytes, no_bass_name)
+            if size <= MAX_CLOUD_RESPONSE_BYTES:
+                print(
+                    f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
+                    f"(no_bass @ {no_bass_bitrate})",
+                    flush=True,
+                )
+                return {
+                    "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
+                    "filename": no_bass_name,
+                }
+            continue
+
+        for bass_bitrate in CLOUD_RETURN_BITRATES:
+            bass_bytes = _encode_mp3_candidate(bass_path, work_dir, bass_bitrate)
+            size = estimate_response_payload_bytes(
+                no_bass_bytes, no_bass_name, bass_bytes, bass_name
+            )
+            if size <= MAX_CLOUD_RESPONSE_BYTES:
+                print(
+                    f"[handler] response payload {size / (1024 * 1024):.2f} MiB "
+                    f"(no_bass @ {no_bass_bitrate}, bass @ {bass_bitrate})",
+                    flush=True,
+                )
+                return {
+                    "output_base64": base64.b64encode(no_bass_bytes).decode("utf-8"),
+                    "filename": no_bass_name,
+                    "bass_output_base64": base64.b64encode(bass_bytes).decode("utf-8"),
+                    "bass_filename": bass_name,
+                }
+
+    raise RuntimeError(
+        "Processed audio is too large for RunPod's 10 MiB response limit. "
+        "Try a shorter clip or disable the bass-only export."
+    )
 
 
 def _mix_stem_paths(stem_paths: list[Path], bass_only: bool) -> tuple[np.ndarray, int]:
@@ -293,18 +377,8 @@ def handler(job):
                 input_path, output_format, speed, work_dir, save_bass_track
             )
 
-            # Return as base64
-            output_bytes = output_path.read_bytes()
-            output_b64 = base64.b64encode(output_bytes).decode("utf-8")
-
-            print(f"[handler] SUCCESS, returning {output_path.name}", flush=True)
-            result = {
-                "output_base64": output_b64,
-                "filename": output_path.name,
-            }
-            if bass_path is not None:
-                result["bass_output_base64"] = base64.b64encode(bass_path.read_bytes()).decode("utf-8")
-                result["bass_filename"] = bass_path.name
+            result = build_cloud_response_payload(output_path, work_dir, bass_path)
+            print(f"[handler] SUCCESS, returning {result['filename']}", flush=True)
             return result
 
     except Exception as e:
