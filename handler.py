@@ -36,13 +36,16 @@ Input example:
   "audio_base64": "<base64 encoded audio>",
   "filename": "song.mp3",
   "output_format": "MP3",   # WAV, MP3 or FLAC
-  "speed": "Quality"        # "Fast" or "Quality"
+  "speed": "Quality",        # "Fast" or "Quality"
+  "save_bass_track": false   # optional — also return bass-only stem
 }
 
 Output:
 {
   "output_base64": "<base64 encoded result>",
-  "filename": "song_no_bass.mp3"
+  "filename": "song_no_bass.mp3",
+  "bass_output_base64": "<optional>",
+  "bass_filename": "song_bass.mp3"
 }
 """
 
@@ -116,10 +119,63 @@ def convert_to_mp3(input_wav: Path, output_mp3: Path):
         raise RuntimeError("ffmpeg not found in the RunPod environment.")
 
 
-def process_audio_cloud(input_path: Path, output_format: str, speed: str, work_dir: Path) -> Path:
+def _mix_stem_paths(stem_paths: list[Path], bass_only: bool) -> tuple[np.ndarray, int]:
+    """Mix stems matching (bass_only) or excluding (not bass_only) BASS_KEYWORDS."""
+    selected = [
+        p for p in stem_paths
+        if any(k in p.stem.lower() for k in BASS_KEYWORDS) == bass_only
+    ]
+    if not selected:
+        kind = "bass" if bass_only else "non-bass"
+        raise ValueError(f"No {kind} stems found")
+
+    mixed = None
+    sample_rate = None
+    for stem_path in selected:
+        data, sr = sf.read(str(stem_path), dtype="float32")
+        if sample_rate is None:
+            sample_rate = sr
+        elif sr != sample_rate:
+            raise ValueError("Sample rate mismatch between stems")
+        mixed = data.copy() if mixed is None else mixed + data
+
+    max_val = np.max(np.abs(mixed))
+    if max_val > 0:
+        mixed = mixed / max_val * 0.95
+    return mixed, sample_rate
+
+
+def _write_mixed_output(
+    mixed: np.ndarray,
+    sample_rate: int,
+    output_path: Path,
+    output_format: str,
+    work_dir: Path,
+    temp_stem: str,
+) -> Path:
+    if output_format in ("WAV", "FLAC"):
+        subtype = "PCM_24" if output_format != "MP3" else None
+        sf.write(str(output_path), mixed, sample_rate, subtype=subtype)
+        return output_path
+
+    temp_wav = work_dir / temp_stem
+    sf.write(str(temp_wav), mixed, sample_rate, subtype="PCM_24")
+    convert_to_mp3(temp_wav, output_path)
+    if temp_wav.exists():
+        temp_wav.unlink()
+    return output_path
+
+
+def process_audio_cloud(
+    input_path: Path,
+    output_format: str,
+    speed: str,
+    work_dir: Path,
+    save_bass_track: bool = False,
+) -> tuple[Path, Path | None]:
     """
     Core separation + mixing logic.
-    Returns the path to the final mixed file.
+    Returns (no_bass_path, bass_path_or_none).
     """
     shifts = 1 if speed == "Fast" else 2
 
@@ -173,40 +229,6 @@ def process_audio_cloud(input_path: Path, output_format: str, speed: str, work_d
             p = output_dir_abs / p
         abs_stem_paths.append(p)
 
-    # Filter out bass-related stems
-    non_bass_stems = [
-        p for p in abs_stem_paths
-        if not any(k in p.stem.lower() for k in BASS_KEYWORDS)
-    ]
-
-    if not non_bass_stems:
-        raise ValueError("No non-bass stems found after separation")
-
-    # Mix
-    mixed = None
-    sample_rate = None
-
-    for stem_path in non_bass_stems:
-        data, sr = sf.read(str(stem_path), dtype='float32')
-        if sample_rate is None:
-            sample_rate = sr
-        elif sr != sample_rate:
-            raise ValueError("Sample rate mismatch between stems")
-
-        if mixed is None:
-            mixed = data.copy()
-        else:
-            mixed += data
-
-    if mixed is None:
-        raise ValueError("Failed to mix stems")
-
-    # Normalize
-    max_val = np.max(np.abs(mixed))
-    if max_val > 0:
-        mixed = mixed / max_val * 0.95
-
-    # Determine output
     base_name = input_path.stem
     if output_format == "MP3":
         ext = "mp3"
@@ -215,23 +237,24 @@ def process_audio_cloud(input_path: Path, output_format: str, speed: str, work_d
     else:
         ext = "wav"
 
+    mixed, sample_rate = _mix_stem_paths(abs_stem_paths, bass_only=False)
     output_path = work_dir / f"{base_name}_no_bass.{ext}"
+    _write_mixed_output(
+        mixed, sample_rate, output_path, output_format, work_dir, f"{base_name}_no_bass_temp.wav"
+    )
 
-    if output_format in ["WAV", "FLAC"]:
-        subtype = "PCM_24" if output_format != "MP3" else None
-        sf.write(str(output_path), mixed, sample_rate, subtype=subtype)
-    else:
-        # MP3 path
-        temp_wav = work_dir / f"{base_name}_temp.wav"
-        sf.write(str(temp_wav), mixed, sample_rate, subtype="PCM_24")
-        convert_to_mp3(temp_wav, output_path)
-        if temp_wav.exists():
-            temp_wav.unlink()
+    bass_path = None
+    if save_bass_track:
+        bass_mixed, bass_sr = _mix_stem_paths(abs_stem_paths, bass_only=True)
+        bass_path = work_dir / f"{base_name}_bass.{ext}"
+        _write_mixed_output(
+            bass_mixed, bass_sr, bass_path, output_format, work_dir, f"{base_name}_bass_temp.wav"
+        )
 
     # Cleanup separated stems
     shutil.rmtree(output_dir_abs, ignore_errors=True)
 
-    return output_path
+    return output_path, bass_path
 
 
 # ================== RUNPOD HANDLER ==================
@@ -251,6 +274,7 @@ def handler(job):
         filename = job_input.get("filename", "input.mp3")
         output_format = job_input.get("output_format", "MP3")
         speed = job_input.get("speed", "Quality")
+        save_bass_track = bool(job_input.get("save_bass_track", False))
 
         if not audio_b64:
             print("[handler] ERROR: Missing audio_base64", flush=True)
@@ -265,17 +289,23 @@ def handler(job):
             print(f"[handler] input saved ({len(audio_b64)} base64 chars) to {input_path}", flush=True)
 
             # Process
-            output_path = process_audio_cloud(input_path, output_format, speed, work_dir)
+            output_path, bass_path = process_audio_cloud(
+                input_path, output_format, speed, work_dir, save_bass_track
+            )
 
             # Return as base64
             output_bytes = output_path.read_bytes()
             output_b64 = base64.b64encode(output_bytes).decode("utf-8")
 
             print(f"[handler] SUCCESS, returning {output_path.name}", flush=True)
-            return {
+            result = {
                 "output_base64": output_b64,
-                "filename": output_path.name
+                "filename": output_path.name,
             }
+            if bass_path is not None:
+                result["bass_output_base64"] = base64.b64encode(bass_path.read_bytes()).decode("utf-8")
+                result["bass_filename"] = bass_path.name
+            return result
 
     except Exception as e:
         # Log the full traceback — this is what you will see in the RunPod worker logs.
