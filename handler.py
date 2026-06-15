@@ -4,16 +4,22 @@ RunPod Serverless Handler for BassRipper Cloud Processing
 This is the code that runs on RunPod's GPU.
 
 Deploy as a Serverless endpoint:
-1. Create new Serverless endpoint in RunPod dashboard
-2. Prefer a GPU Python template (CUDA) or build/push the Dockerfile as custom container image.
-3. For "Upload code" path: upload this file as handler.py
-4. For "Upload code" path: upload the *worker* requirements (the file named runpod_worker_requirements.txt in the repo) as requirements.txt
-   (The Dockerfile handles the mapping for Docker builds: it copies runpod_worker_requirements.txt as requirements.txt inside the image.)
-5. **Attach a Network Volume** and note the mount path you chose (e.g. /runpod-volume).
-6. Choose a strong GPU (RTX 4090-class recommended).
-7. Set min workers to 1 (or higher), idle timeout reasonably high, and pre-warm once "Running".
-8. Deploy and copy the Serverless Endpoint ID into the desktop app's runpod_endpoint_id.txt
-   (together with a valid runpod_api_key.txt). The desktop app commits to cloud or falls back locally.
+1. Create new Serverless endpoint in RunPod dashboard (or edit existing).
+2. Preferred: build & push the Dockerfile as a **Custom** container image (see below), or use "Upload code" for quick iteration.
+3. For "Upload code" path: upload this file as handler.py + the worker requirements (runpod_worker_requirements.txt renamed to requirements.txt).
+4. The Dockerfile (in repo) produces the proper image for the "Custom" path.
+5. **Attach a Network Volume** and note the mount path (e.g. /runpod-volume). This is critical for model caching.
+6. In endpoint advanced settings / env: set MODEL_CACHE=/runpod-volume/models (must match the path in handler.py and volume mount).
+7. Choose a strong GPU (RTX 4090-class recommended). Set min workers=1 + reasonable idle timeout.
+8. After first "Running", send at least one job (or trigger from desktop app) so the htdemucs_ft model downloads to the volume.
+9. Copy the Serverless Endpoint ID + your RunPod API key into the desktop app config (see below). The desktop app now *automatically* routes to cloud when credit >= $0.05 (see MIN_CLOUD_CREDIT in main.py), with seamless local fallback.
+
+Desktop app configuration (secrets, never committed):
+- Files live in: %LOCALAPPDATA%\Kinell\BassRipper\   (or equivalent platformdirs.user_config_dir)
+- Create runpod_api_key.txt (contents: your rpa_... key)
+- Create runpod_endpoint_id.txt (contents: your endpoint id like pvnc91yr9qm5af)
+- Optionally create dev_mode.txt (empty file) to see credit balance, technical statuses and the "cancel to local" button.
+- The app calls get_runpod_credit before every rip and only uses cloud when balance is sufficient.
 
 Note on requirements files (important):
 - Root requirements.txt in the repo = for the desktop BassRipper app + PyInstaller builds (includes customtkinter etc.).
@@ -51,7 +57,11 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from audio_separator.separator import Separator
+
+print("=== HANDLER.PY MODULE-LEVEL START ===", flush=True)
+print("Python:", sys.version, flush=True)
+print("MODEL_CACHE env:", os.environ.get("MODEL_CACHE"), flush=True)
+print("sys.path:", sys.path[:3], "...", flush=True)
 
 print("[handler] imports successful", flush=True)
 
@@ -63,7 +73,17 @@ CHUNK_DURATION = 60
 # Model cache directory. Override with env var MODEL_CACHE so you can point it at your Network Volume mount.
 # Example (in RunPod endpoint settings): MODEL_CACHE=/runpod-volume/models
 MODEL_CACHE_DIR = os.environ.get("MODEL_CACHE", "/tmp/models")
-print(f"[handler] Using MODEL_CACHE_DIR={MODEL_CACHE_DIR} (set MODEL_CACHE env for your volume mount)")
+try:
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+except OSError as cache_err:
+    print(
+        f"[handler] WARNING: cannot create MODEL_CACHE_DIR={MODEL_CACHE_DIR}: {cache_err}. "
+        "Falling back to /tmp/models (attach a Network Volume and set MODEL_CACHE for persistence).",
+        flush=True,
+    )
+    MODEL_CACHE_DIR = "/tmp/models"
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+print(f"[handler] Using MODEL_CACHE_DIR={MODEL_CACHE_DIR} (set MODEL_CACHE env for your volume mount)", flush=True)
 
 # ================== HELPER FUNCTIONS (adapted from main.py) ==================
 def get_ffmpeg_path():
@@ -108,6 +128,8 @@ def process_audio_cloud(input_path: Path, output_format: str, speed: str, work_d
     output_dir_abs.mkdir(parents=True, exist_ok=True)
 
     print(f"[handler] process_audio_cloud start, speed={speed}, output_format={output_format}", flush=True)
+    from audio_separator.separator import Separator
+
     separator = Separator(
         output_dir=str(output_dir_abs),
         output_format="wav",
@@ -265,5 +287,18 @@ def handler(job):
         return {"error": err_msg}
 
 
-import runpod
-runpod.serverless.start({"handler": handler})
+print("[handler] importing runpod SDK...", flush=True)
+try:
+    import runpod
+except Exception as import_err:
+    print(f"[handler] FATAL: runpod import failed: {import_err}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
+
+print("[handler] starting runpod.serverless (this process must stay alive)...", flush=True)
+try:
+    runpod.serverless.start({"handler": handler})
+except Exception as start_err:
+    print(f"[handler] FATAL: runpod.serverless.start failed: {start_err}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)

@@ -10,10 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Torch/torchaudio already in the RunPod PyTorch base — only install worker deps.
-COPY runpod_worker_requirements.docker.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Inlined so the worker GitHub repo does not need a separate requirements file.
+RUN pip install --no-cache-dir \
+    audio-separator==0.41.1 \
+    soundfile==0.13.1 \
+    "numpy>=1.26" \
+    "runpod>=1.7.0"
 
-# Handler last (frequent edits); does not bust the pip layer above on GitHub rebuilds.
 COPY handler.py .
 
 CMD ["python", "-u", "handler.py"]
